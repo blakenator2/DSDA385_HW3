@@ -1,245 +1,298 @@
+"""
+EN → DE Seq2Seq RNN Translation (PyTorch)
+Multi30k (bentrevett/multi30k) + one-hot word embeddings + BLEU scoring
+
+Install dependencies:
+    pip install torch datasets nltk
+
+Run:
+    python rnn_multi30k_onehot_torch.py
+"""
+
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 import nltk
 nltk.download("punkt", quiet=True)
 
-def runRNN():
-    print("Loading Multi30k …")
-    raw = load_dataset("bentrevett/multi30k")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}")
 
-    SOS, EOS, PAD, UNK = "<sos>", "<eos>", "<pad>", "<unk>"
+# ─────────────────────────────────────────────
+# 1. Load Multi30k
+# ─────────────────────────────────────────────
+print("Loading Multi30k …")
+raw = load_dataset("bentrevett/multi30k")
 
-    def get_pairs(split):
-        en_sents, de_sents = [], []
-        for row in raw[split]:
-            en_sents.append(row["en"].lower().split())
-            de_sents.append(row["de"].lower().split())
-        return en_sents, de_sents
+SOS, EOS, PAD, UNK = "<sos>", "<eos>", "<pad>", "<unk>"
 
-    train_en, train_de = get_pairs("train")
-    val_en,   val_de   = get_pairs("validation")
-    test_en,  test_de  = get_pairs("test")
+def get_pairs(split):
+    en_sents, de_sents = [], []
+    for row in raw[split]:
+        en_sents.append(row["en"].lower().split())
+        de_sents.append(row["de"].lower().split())
+    return en_sents, de_sents
 
-    print(f"Train pairs : {len(train_en):,}")
-    print(f"Val pairs   : {len(val_en):,}")
-    print(f"Test pairs  : {len(test_en):,}")
+train_en, train_de = get_pairs("train")
+val_en,   val_de   = get_pairs("validation")
+test_en,  test_de  = get_pairs("test")
 
-    # ─────────────────────────────────────────────
-    # 2. Build vocabularies
-    # ─────────────────────────────────────────────
-    def build_vocab(sentences):
-        specials = [PAD, UNK, SOS, EOS]
-        words    = sorted({t for sent in sentences for t in sent})
-        vocab    = specials + words
-        w2i      = {w: i for i, w in enumerate(vocab)}
-        i2w      = {i: w for w, i in w2i.items()}
-        return w2i, i2w, len(vocab)
+print(f"Train pairs : {len(train_en):,}")
+print(f"Val pairs   : {len(val_en):,}")
+print(f"Test pairs  : {len(test_en):,}")
 
-    en_w2i, en_i2w, EN_VOCAB = build_vocab(train_en)
-    de_w2i, de_i2w, DE_VOCAB = build_vocab(train_de)
+# ─────────────────────────────────────────────
+# 2. Build vocabularies
+# ─────────────────────────────────────────────
+def build_vocab(sentences):
+    specials = [PAD, UNK, SOS, EOS]
+    words    = sorted({t for sent in sentences for t in sent})
+    vocab    = specials + words
+    w2i      = {w: i for i, w in enumerate(vocab)}
+    i2w      = {i: w for w, i in w2i.items()}
+    return w2i, i2w, len(vocab)
 
-    print(f"EN vocab: {EN_VOCAB:,}  |  DE vocab: {DE_VOCAB:,}")
+en_w2i, en_i2w, EN_VOCAB = build_vocab(train_en)
+de_w2i, de_i2w, DE_VOCAB = build_vocab(train_de)
 
-    # ─────────────────────────────────────────────
-    # 3. Encode & pad
-    # ─────────────────────────────────────────────
-    MAX_EN = 40
-    MAX_DE = 42   # +2 for SOS / EOS
+print(f"EN vocab: {EN_VOCAB:,}  |  DE vocab: {DE_VOCAB:,}")
 
-    def pad_seq(seq, max_len, pad_id):
-        seq = seq[:max_len]
-        return seq + [pad_id] * (max_len - len(seq))
+# ─────────────────────────────────────────────
+# 3. Encode & pad
+# ─────────────────────────────────────────────
+MAX_EN = 40
+MAX_DE = 42   # +2 for SOS / EOS
 
-    def encode_en(sent):
-        return [en_w2i.get(t, en_w2i[UNK]) for t in sent]
+def pad_seq(seq, max_len, pad_id):
+    seq = seq[:max_len]
+    return seq + [pad_id] * (max_len - len(seq))
 
-    def encode_de(sent):
-        return ([de_w2i[SOS]]
-                + [de_w2i.get(t, de_w2i[UNK]) for t in sent]
-                + [de_w2i[EOS]])
+def encode_en(sent):
+    return [en_w2i.get(t, en_w2i[UNK]) for t in sent]
 
-    def make_arrays(en_sents, de_sents):
-        enc_in, dec_in, dec_tgt = [], [], []
+def encode_de(sent):
+    return ([de_w2i[SOS]]
+            + [de_w2i.get(t, de_w2i[UNK]) for t in sent]
+            + [de_w2i[EOS]])
+
+# ─────────────────────────────────────────────
+# 4. PyTorch Dataset — one-hot applied in __getitem__
+# ─────────────────────────────────────────────
+class TranslationDataset(Dataset):
+    def __init__(self, en_sents, de_sents):
+        self.enc_in, self.dec_in, self.dec_tgt = [], [], []
         for en, de in zip(en_sents, de_sents):
-            ei  = pad_seq(encode_en(en), MAX_EN, en_w2i[PAD])
+            ei  = pad_seq(encode_en(en),  MAX_EN, en_w2i[PAD])
             de_ = encode_de(de)
-            di  = pad_seq(de_[:-1], MAX_DE, de_w2i[PAD])   # SOS … (teacher forcing)
-            dt  = pad_seq(de_[1:],  MAX_DE, de_w2i[PAD])   # … EOS (target)
-            enc_in.append(ei); dec_in.append(di); dec_tgt.append(dt)
-        return (np.array(enc_in,  dtype=np.int32),
-                np.array(dec_in,  dtype=np.int32),
-                np.array(dec_tgt, dtype=np.int32))
+            di  = pad_seq(de_[:-1], MAX_DE, de_w2i[PAD])
+            dt  = pad_seq(de_[1:],  MAX_DE, de_w2i[PAD])
+            self.enc_in.append(ei)
+            self.dec_in.append(di)
+            self.dec_tgt.append(dt)
+        # store as integer tensors — one-hot applied in __getitem__
+        self.enc_in  = torch.tensor(self.enc_in,  dtype=torch.long)
+        self.dec_in  = torch.tensor(self.dec_in,  dtype=torch.long)
+        self.dec_tgt = torch.tensor(self.dec_tgt, dtype=torch.long)
 
-    train_ei, train_di, train_dt = make_arrays(train_en, train_de)
-    val_ei,   val_di,   val_dt   = make_arrays(val_en,   val_de)
+    def __len__(self):
+        return len(self.enc_in)
 
-    # ─────────────────────────────────────────────
-    # 4. tf.data — one-hot encode inputs inline
-    # ─────────────────────────────────────────────
-    # One-hot is applied inside the pipeline so the large float tensors
-    # are never stored in memory all at once.
-    BATCH_SIZE = 64
-    BUFFER     = 5_000
+    def __getitem__(self, idx):
+        enc_oh = torch.nn.functional.one_hot(
+            self.enc_in[idx], num_classes=EN_VOCAB).float()   # (MAX_EN, EN_VOCAB)
+        dec_oh = torch.nn.functional.one_hot(
+            self.dec_in[idx], num_classes=DE_VOCAB).float()   # (MAX_DE, DE_VOCAB)
+        return enc_oh, dec_oh, self.dec_tgt[idx]
 
-    def onehot_inputs(inputs, targets):
-        enc_in, dec_in = inputs
-        enc_oh = tf.one_hot(enc_in, EN_VOCAB)   # (B, MAX_EN, EN_VOCAB)
-        dec_oh = tf.one_hot(dec_in, DE_VOCAB)   # (B, MAX_DE, DE_VOCAB)
-        return (enc_oh, dec_oh), targets
+BATCH_SIZE = 64
 
-    def make_dataset(ei, di, dt, shuffle=True):
-        ds = tf.data.Dataset.from_tensor_slices(((ei, di), dt))
-        if shuffle:
-            ds = ds.shuffle(BUFFER)
-        return (ds.batch(BATCH_SIZE, drop_remainder=False)
-                .map(onehot_inputs, num_parallel_calls=tf.data.AUTOTUNE)
-                .prefetch(tf.data.AUTOTUNE))
+train_ds = TranslationDataset(train_en, train_de)
+val_ds   = TranslationDataset(val_en,   val_de)
 
-    train_ds = make_dataset(train_ei, train_di, train_dt, shuffle=True)
-    val_ds   = make_dataset(val_ei,   val_di,   val_dt,   shuffle=False)
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
+val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
 
-    # ─────────────────────────────────────────────
-    # 5. Seq2Seq model — SimpleRNN encoder-decoder
-    #    Input is one-hot so no Embedding layer needed
-    # ─────────────────────────────────────────────
-    HIDDEN = 512
+# ─────────────────────────────────────────────
+# 5. Seq2Seq model — SimpleRNN encoder-decoder
+#    Input is one-hot so no Embedding layer needed
+# ─────────────────────────────────────────────
+HIDDEN = 512
 
-    # Encoder: reads one-hot EN vectors → hidden state
-    enc_input       = tf.keras.Input(shape=(MAX_EN, EN_VOCAB), name="encoder_input")
-    enc_drop        = tf.keras.layers.Dropout(0.3)(enc_input)
-    _, enc_h        = tf.keras.layers.SimpleRNN(HIDDEN, return_state=True,
-                        name="encoder_rnn")(enc_drop)
+class Encoder(nn.Module):
+    def __init__(self, input_size, hidden_size, dropout=0.3):
+        super().__init__()
+        self.rnn     = nn.RNN(input_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
 
-    # Decoder: reads one-hot DE vectors, initialised from encoder state
-    dec_input       = tf.keras.Input(shape=(MAX_DE, DE_VOCAB), name="decoder_input")
-    dec_drop        = tf.keras.layers.Dropout(0.3)(dec_input)
-    dec_out, _      = tf.keras.layers.SimpleRNN(HIDDEN, return_sequences=True,
-                        return_state=True, name="decoder_rnn")(
-                        dec_drop, initial_state=enc_h)
-    logits          = tf.keras.layers.Dense(DE_VOCAB,
-                        name="output_projection")(dec_out)
-
-    model = tf.keras.Model(inputs=[enc_input, dec_input],
-                        outputs=logits, name="seq2seq_rnn_onehot")
-
-    # ─────────────────────────────────────────────
-    # 6. Masked loss, perplexity, compile
-    # ─────────────────────────────────────────────
-    _loss_base = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, reduction="none")
-
-    def masked_loss(y_true, y_pred):
-        loss = _loss_base(y_true, y_pred)
-        mask = tf.cast(tf.not_equal(y_true, de_w2i[PAD]), loss.dtype)
-        return tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
-
-    class Perplexity(tf.keras.metrics.Mean):
-        def update_state(self, y_true, y_pred, sample_weight=None):
-            super().update_state(tf.exp(masked_loss(y_true, y_pred)),
-                                sample_weight=sample_weight)
-
-    model.compile(
-        optimizer = tf.keras.optimizers.Adam(1e-3),
-        loss      = masked_loss,
-        metrics   = [Perplexity(name="perplexity")],
-    )
-    model.summary()
-
-    # ─────────────────────────────────────────────
-    # 7. Inference encoder / decoder
-    # ─────────────────────────────────────────────
-    enc_model = tf.keras.Model(inputs=enc_input,
-                            outputs=enc_h,
-                            name="inference_encoder")
-
-    dec_h_in   = tf.keras.Input(shape=(HIDDEN,), name="dec_h_in")
-    dec_tok_in = tf.keras.Input(shape=(1, DE_VOCAB), name="dec_token_onehot")
-
-    _out, _h_out = model.get_layer("decoder_rnn")(
-        dec_tok_in, initial_state=dec_h_in)
-    _logits = model.get_layer("output_projection")(_out)
-
-    dec_model = tf.keras.Model(
-        inputs  = [dec_tok_in, dec_h_in],
-        outputs = [_logits, _h_out],
-        name    = "inference_decoder")
+    def forward(self, x):
+        # x: (B, MAX_EN, EN_VOCAB)
+        _, h = self.rnn(self.dropout(x))   # h: (1, B, HIDDEN)
+        return h
 
 
-    def translate(src_tokens, max_len=MAX_DE):
-        """Greedy decode: src_tokens is a list of English words."""
-        ei  = pad_seq(encode_en(src_tokens), MAX_EN, en_w2i[PAD])
-        enc_oh = tf.one_hot([ei], EN_VOCAB)                 # (1, MAX_EN, EN_VOCAB)
-        h   = enc_model.predict(enc_oh, verbose=0)          # (1, HIDDEN)
+class Decoder(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, dropout=0.3):
+        super().__init__()
+        self.rnn     = nn.RNN(input_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc      = nn.Linear(hidden_size, output_size)
 
-        # Seed the decoder with SOS as a one-hot vector
-        tok = tf.one_hot([[de_w2i[SOS]]], DE_VOCAB)         # (1, 1, DE_VOCAB)
+    def forward(self, x, h):
+        # x: (B, MAX_DE, DE_VOCAB)  h: (1, B, HIDDEN)
+        out, h = self.rnn(self.dropout(x), h)   # out: (B, T, HIDDEN)
+        logits = self.fc(out)                   # (B, T, DE_VOCAB)
+        return logits, h
+
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, trg):
+        # src: (B, MAX_EN, EN_VOCAB)  trg: (B, MAX_DE, DE_VOCAB)
+        h      = self.encoder(src)
+        logits, _ = self.decoder(trg, h)
+        return logits
+
+
+encoder = Encoder(input_size=EN_VOCAB, hidden_size=HIDDEN)
+decoder = Decoder(input_size=DE_VOCAB, hidden_size=HIDDEN, output_size=DE_VOCAB)
+model   = Seq2Seq(encoder, decoder).to(DEVICE)
+
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\nTrainable parameters: {total_params:,}")
+print(model)
+
+# ─────────────────────────────────────────────
+# 6. Loss (masked padding), optimizer
+# ─────────────────────────────────────────────
+PAD_IDX   = de_w2i[PAD]
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# ─────────────────────────────────────────────
+# 7. Train / eval epoch helpers
+# ─────────────────────────────────────────────
+def run_epoch(loader, train=True):
+    model.train() if train else model.eval()
+    total_loss, n = 0.0, 0
+    ctx = torch.enable_grad() if train else torch.no_grad()
+    with ctx:
+        for enc_oh, dec_oh, dec_tgt in loader:
+            enc_oh  = enc_oh.to(DEVICE)
+            dec_oh  = dec_oh.to(DEVICE)
+            dec_tgt = dec_tgt.to(DEVICE)
+
+            logits = model(enc_oh, dec_oh)              # (B, T, DE_VOCAB)
+            loss   = criterion(
+                logits.reshape(-1, DE_VOCAB),
+                dec_tgt.reshape(-1))
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            total_loss += loss.item()
+            n          += 1
+
+    avg_loss   = total_loss / n
+    perplexity = float(np.exp(avg_loss))
+    return avg_loss, perplexity
+
+# ─────────────────────────────────────────────
+# 8. Greedy translate (inference)
+# ─────────────────────────────────────────────
+def translate(src_tokens, max_len=MAX_DE):
+    model.eval()
+    ei    = pad_seq(encode_en(src_tokens), MAX_EN, en_w2i[PAD])
+    enc_oh = torch.nn.functional.one_hot(
+        torch.tensor(ei, dtype=torch.long),
+        num_classes=EN_VOCAB).float().unsqueeze(0).to(DEVICE)   # (1, MAX_EN, EN_VOCAB)
+
+    with torch.no_grad():
+        h   = model.encoder(enc_oh)                             # (1, 1, HIDDEN)
+        tok = de_w2i[SOS]
         result = []
         for _ in range(max_len):
-            logits, h = dec_model.predict([tok, h], verbose=0)
-            next_id   = int(np.argmax(logits[0]))
-            word      = de_i2w[next_id]
+            tok_oh = torch.nn.functional.one_hot(
+                torch.tensor([[tok]], dtype=torch.long),
+                num_classes=DE_VOCAB).float().to(DEVICE)        # (1, 1, DE_VOCAB)
+            logits, h = model.decoder(tok_oh, h)                # (1, 1, DE_VOCAB)
+            tok = logits[0, 0].argmax().item()
+            word = de_i2w[tok]
             if word == EOS:
                 break
             result.append(word)
-            tok = tf.one_hot([[next_id]], DE_VOCAB)         # (1, 1, DE_VOCAB)
-        return result
+    return result
 
-    # ─────────────────────────────────────────────
-    # 8. BLEU scoring
-    # ─────────────────────────────────────────────
-    smoother = SmoothingFunction().method1
+# ─────────────────────────────────────────────
+# 9. BLEU scoring
+# ─────────────────────────────────────────────
+smoother = SmoothingFunction().method1
 
-    def compute_bleu(en_sents, de_refs, label="BLEU", n_samples=500):
-        hypotheses, references = [], []
-        n = min(n_samples, len(en_sents))
-        for en, ref in zip(en_sents[:n], de_refs[:n]):
-            hypotheses.append(translate(en))
-            references.append([ref])
-        score = corpus_bleu(references, hypotheses,
-                            smoothing_function=smoother) * 100
-        print(f"[{label}]  Corpus BLEU-4: {score:.2f}")
-        return score
+def compute_bleu(en_sents, de_refs, label="BLEU", n_samples=500):
+    hypotheses, references = [], []
+    n = min(n_samples, len(en_sents))
+    for en, ref in zip(en_sents[:n], de_refs[:n]):
+        hypotheses.append(translate(en))
+        references.append([ref])
+    score = corpus_bleu(references, hypotheses,
+                        smoothing_function=smoother) * 100
+    print(f"[{label}]  Corpus BLEU-4: {score:.2f}")
+    return score
 
-    # ─────────────────────────────────────────────
-    # 9. Train
-    # ─────────────────────────────────────────────
-    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath          = "rnn_multi30k_onehot.weights.h5",
-        save_weights_only = True,
-        save_best_only    = True,
-        monitor           = "val_loss",
-        verbose           = 1,
-    )
+# ─────────────────────────────────────────────
+# 10. Train
+# ─────────────────────────────────────────────
+EPOCHS      = 10
+best_val    = float("inf")
 
-    EPOCHS = 10
-    print(f"\n── Training for {EPOCHS} epochs ──")
-    model.fit(train_ds, validation_data=val_ds,
-            epochs=EPOCHS, callbacks=[checkpoint_cb])
+print(f"\n── Training for {EPOCHS} epochs ──")
+for epoch in range(1, EPOCHS + 1):
+    tr_loss, tr_ppl = run_epoch(train_dl, train=True)
+    vl_loss, vl_ppl = run_epoch(val_dl,   train=False)
+    print(f"Epoch {epoch:>2}/{EPOCHS} | "
+          f"train loss {tr_loss:.4f} ppl {tr_ppl:.1f} | "
+          f"val loss {vl_loss:.4f} ppl {vl_ppl:.1f}")
+    if vl_loss < best_val:
+        best_val = vl_loss
+        torch.save(model.state_dict(), "rnn_multi30k_onehot.pt")
+        print(f"           ✓ checkpoint saved (val_loss={best_val:.4f})")
 
-    # ─────────────────────────────────────────────
-    # 10. Final evaluation
-    # ─────────────────────────────────────────────
-    print("\n── Loss & Perplexity ──")
-    print("Train:", end=" "); model.evaluate(train_ds, verbose=1)
-    print("Val  :", end=" "); model.evaluate(val_ds,   verbose=1)
+# ─────────────────────────────────────────────
+# 11. Final evaluation
+# ─────────────────────────────────────────────
+model.load_state_dict(torch.load("rnn_multi30k_onehot.pt", map_location=DEVICE))
 
-    print("\n── BLEU scores (greedy, 500 samples) ──")
-    compute_bleu(train_en, train_de, label="train", n_samples=500)
-    compute_bleu(val_en,   val_de,   label="val  ", n_samples=500)
-    compute_bleu(test_en,  test_de,  label="test ", n_samples=500)
+print("\n── Final Loss & Perplexity ──")
+tr_loss, tr_ppl = run_epoch(train_dl, train=False)
+vl_loss, vl_ppl = run_epoch(val_dl,   train=False)
+print(f"[train]  loss: {tr_loss:.4f}  |  perplexity: {tr_ppl:.2f}")
+print(f"[val  ]  loss: {vl_loss:.4f}  |  perplexity: {vl_ppl:.2f}")
 
-    # ─────────────────────────────────────────────
-    # 11. Demo translations
-    # ─────────────────────────────────────────────
-    print("\n── Example translations (EN → DE) ──")
-    demos = [
-        "a dog is running through the grass .",
-        "two people are sitting on a bench .",
-        "a man is riding a bicycle .",
-    ]
-    for src in demos:
-        hyp = translate(src.split())
-        print(f"  EN : {src}")
-        print(f"  DE : {' '.join(hyp)}\n")
+print("\n── BLEU scores (greedy, 500 samples) ──")
+compute_bleu(train_en, train_de, label="train", n_samples=500)
+compute_bleu(val_en,   val_de,   label="val  ", n_samples=500)
+compute_bleu(test_en,  test_de,  label="test ", n_samples=500)
+
+# ─────────────────────────────────────────────
+# 12. Demo translations
+# ─────────────────────────────────────────────
+print("\n── Example translations (EN → DE) ──")
+demos = [
+    "a dog is running through the grass .",
+    "two people are sitting on a bench .",
+    "a man is riding a bicycle .",
+]
+for src in demos:
+    hyp = translate(src.split())
+    print(f"  EN : {src}")
+    print(f"  DE : {' '.join(hyp)}\n")

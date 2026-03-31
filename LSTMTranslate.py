@@ -1,268 +1,316 @@
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from gensim.models import Word2Vec
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 import nltk
 nltk.download("punkt", quiet=True)
 
-def run():
-    # ─────────────────────────────────────────────
-    # 1. Load Multi30k
-    # ─────────────────────────────────────────────
-    print("Loading Multi30k …")
-    raw = load_dataset("bentrevett/multi30k")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {DEVICE}")
 
-    SOS, EOS, PAD, UNK = "<sos>", "<eos>", "<pad>", "<unk>"
+# ─────────────────────────────────────────────
+# 1. Load Multi30k
+# ─────────────────────────────────────────────
+print("Loading Multi30k …")
+raw = load_dataset("bentrevett/multi30k")
 
-    def get_pairs(split):
-        en_sents, de_sents = [], []
-        for row in raw[split]:
-            en_sents.append(row["en"].lower().split())
-            de_sents.append(row["de"].lower().split())
-        return en_sents, de_sents
+SOS, EOS, PAD, UNK = "<sos>", "<eos>", "<pad>", "<unk>"
 
-    train_en, train_de = get_pairs("train")
-    val_en,   val_de   = get_pairs("validation")
-    test_en,  test_de  = get_pairs("test")
+def get_pairs(split):
+    en_sents, de_sents = [], []
+    for row in raw[split]:
+        en_sents.append(row["en"].lower().split())
+        de_sents.append(row["de"].lower().split())
+    return en_sents, de_sents
 
-    print(f"Train pairs : {len(train_en):,}")
-    print(f"Val pairs   : {len(val_en):,}")
-    print(f"Test pairs  : {len(test_en):,}")
+train_en, train_de = get_pairs("train")
+val_en,   val_de   = get_pairs("validation")
+test_en,  test_de  = get_pairs("test")
 
-    # ─────────────────────────────────────────────
-    # 2. Train Word2Vec — one model per language
-    # ─────────────────────────────────────────────
-    EMBED_DIM = 64
+print(f"Train pairs : {len(train_en):,}")
+print(f"Val pairs   : {len(val_en):,}")
+print(f"Test pairs  : {len(test_en):,}")
 
-    print("\nTraining Word2Vec (EN) …")
-    w2v_en = Word2Vec(train_en, vector_size=EMBED_DIM, window=5,
-                    min_count=1, workers=4, epochs=10, seed=42)
+# ─────────────────────────────────────────────
+# 2. Train Word2Vec — one model per language
+# ─────────────────────────────────────────────
+EMBED_DIM = 64
 
-    print("Training Word2Vec (DE) …")
-    w2v_de = Word2Vec(train_de, vector_size=EMBED_DIM, window=5,
-                    min_count=1, workers=4, epochs=10, seed=42)
+print("\nTraining Word2Vec (EN) …")
+w2v_en = Word2Vec(train_en, vector_size=EMBED_DIM, window=5,
+                  min_count=1, workers=4, epochs=10, seed=42)
 
-    # ─────────────────────────────────────────────
-    # 3. Vocabulary helpers
-    # ─────────────────────────────────────────────
-    def build_vocab(w2v_model):
-        specials   = [PAD, UNK, SOS, EOS]
-        vocab      = specials + list(w2v_model.wv.index_to_key)
-        w2i        = {w: i for i, w in enumerate(vocab)}
-        i2w        = {i: w for w, i in w2i.items()}
-        vocab_size = len(vocab)
-        emb_matrix = np.zeros((vocab_size, EMBED_DIM), dtype=np.float32)
-        for word, idx in w2i.items():
-            if word in w2v_model.wv:
-                emb_matrix[idx] = w2v_model.wv[word]
-        return w2i, i2w, vocab_size, emb_matrix
+print("Training Word2Vec (DE) …")
+w2v_de = Word2Vec(train_de, vector_size=EMBED_DIM, window=5,
+                  min_count=1, workers=4, epochs=10, seed=42)
 
-    en_w2i, en_i2w, EN_VOCAB, en_emb = build_vocab(w2v_en)
-    de_w2i, de_i2w, DE_VOCAB, de_emb = build_vocab(w2v_de)
+# ─────────────────────────────────────────────
+# 3. Vocabulary helpers
+# ─────────────────────────────────────────────
+def build_vocab(w2v_model):
+    specials   = [PAD, UNK, SOS, EOS]
+    vocab      = specials + list(w2v_model.wv.index_to_key)
+    w2i        = {w: i for i, w in enumerate(vocab)}
+    i2w        = {i: w for w, i in w2i.items()}
+    vocab_size = len(vocab)
+    emb_matrix = np.zeros((vocab_size, EMBED_DIM), dtype=np.float32)
+    for word, idx in w2i.items():
+        if word in w2v_model.wv:
+            emb_matrix[idx] = w2v_model.wv[word]
+    return w2i, i2w, vocab_size, emb_matrix
 
-    print(f"EN vocab: {EN_VOCAB:,}  |  DE vocab: {DE_VOCAB:,}")
+en_w2i, en_i2w, EN_VOCAB, en_emb = build_vocab(w2v_en)
+de_w2i, de_i2w, DE_VOCAB, de_emb = build_vocab(w2v_de)
 
-    # ─────────────────────────────────────────────
-    # 4. Encode & pad sentence pairs
-    # ─────────────────────────────────────────────
-    MAX_EN = 40
-    MAX_DE = 42   # +2 for SOS / EOS
+print(f"EN vocab: {EN_VOCAB:,}  |  DE vocab: {DE_VOCAB:,}")
 
-    def pad_seq(seq, max_len, pad_id):
-        seq = seq[:max_len]
-        return seq + [pad_id] * (max_len - len(seq))
+# ─────────────────────────────────────────────
+# 4. Encode & pad sentence pairs
+# ─────────────────────────────────────────────
+MAX_EN = 40
+MAX_DE = 42
 
-    def encode_en(sent):
-        return [en_w2i.get(t, en_w2i[UNK]) for t in sent]
+def pad_seq(seq, max_len, pad_id):
+    seq = seq[:max_len]
+    return seq + [pad_id] * (max_len - len(seq))
 
-    def encode_de(sent):
-        return ([de_w2i[SOS]]
-                + [de_w2i.get(t, de_w2i[UNK]) for t in sent]
-                + [de_w2i[EOS]])
+def encode_en(sent):
+    return [en_w2i.get(t, en_w2i[UNK]) for t in sent]
 
-    def make_arrays(en_sents, de_sents):
-        enc_in, dec_in, dec_tgt = [], [], []
+def encode_de(sent):
+    return ([de_w2i[SOS]]
+            + [de_w2i.get(t, de_w2i[UNK]) for t in sent]
+            + [de_w2i[EOS]])
+
+# ─────────────────────────────────────────────
+# 5. PyTorch Dataset & DataLoader
+# ─────────────────────────────────────────────
+class TranslationDataset(Dataset):
+    def __init__(self, en_sents, de_sents):
+        self.enc_in, self.dec_in, self.dec_tgt = [], [], []
         for en, de in zip(en_sents, de_sents):
             ei  = pad_seq(encode_en(en),  MAX_EN, en_w2i[PAD])
             de_ = encode_de(de)
-            di  = pad_seq(de_[:-1], MAX_DE, de_w2i[PAD])  # SOS … (teacher forcing)
-            dt  = pad_seq(de_[1:],  MAX_DE, de_w2i[PAD])  # … EOS (target)
-            enc_in.append(ei); dec_in.append(di); dec_tgt.append(dt)
-        return (np.array(enc_in,  dtype=np.int32),
-                np.array(dec_in,  dtype=np.int32),
-                np.array(dec_tgt, dtype=np.int32))
+            di  = pad_seq(de_[:-1], MAX_DE, de_w2i[PAD])
+            dt  = pad_seq(de_[1:],  MAX_DE, de_w2i[PAD])
+            self.enc_in.append(ei)
+            self.dec_in.append(di)
+            self.dec_tgt.append(dt)
+        self.enc_in  = torch.tensor(self.enc_in,  dtype=torch.long)
+        self.dec_in  = torch.tensor(self.dec_in,  dtype=torch.long)
+        self.dec_tgt = torch.tensor(self.dec_tgt, dtype=torch.long)
 
-    train_ei, train_di, train_dt = make_arrays(train_en, train_de)
-    val_ei,   val_di,   val_dt   = make_arrays(val_en,   val_de)
+    def __len__(self):
+        return len(self.enc_in)
 
-    # ─────────────────────────────────────────────
-    # 5. tf.data pipelines
-    # ─────────────────────────────────────────────
-    BATCH_SIZE = 64
-    BUFFER     = 5_000
+    def __getitem__(self, idx):
+        return self.enc_in[idx], self.dec_in[idx], self.dec_tgt[idx]
 
-    def make_dataset(ei, di, dt, shuffle=True):
-        ds = tf.data.Dataset.from_tensor_slices(((ei, di), dt))
-        if shuffle:
-            ds = ds.shuffle(BUFFER)
-        return ds.batch(BATCH_SIZE, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
+BATCH_SIZE = 64
 
-    train_ds = make_dataset(train_ei, train_di, train_dt, shuffle=True)
-    val_ds   = make_dataset(val_ei,   val_di,   val_dt,   shuffle=False)
+train_ds = TranslationDataset(train_en, train_de)
+val_ds   = TranslationDataset(val_en,   val_de)
 
-    # ─────────────────────────────────────────────
-    # 6. Seq2Seq model (encoder-decoder LSTM)
-    # ─────────────────────────────────────────────
-    HIDDEN = 256
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  drop_last=False)
+val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
 
-    # Encoder
-    enc_input        = tf.keras.Input(shape=(MAX_EN,), name="encoder_input")
-    enc_emb          = tf.keras.layers.Embedding(EN_VOCAB, EMBED_DIM,
-                        weights=[en_emb], trainable=False,
-                        name="enc_embedding")(enc_input)
-    enc_drop         = tf.keras.layers.Dropout(0.3)(enc_emb)
-    _, enc_h, enc_c  = tf.keras.layers.LSTM(HIDDEN, return_state=True,
-                        name="encoder_lstm")(enc_drop)
+# ─────────────────────────────────────────────
+# 6. Seq2Seq Model
+# ─────────────────────────────────────────────
+HIDDEN = 256
 
-    # Decoder (teacher forcing during training)
-    dec_input        = tf.keras.Input(shape=(MAX_DE,), name="decoder_input")
-    dec_emb          = tf.keras.layers.Embedding(DE_VOCAB, EMBED_DIM,
-                        weights=[de_emb], trainable=False,
-                        name="dec_embedding")(dec_input)
-    dec_drop         = tf.keras.layers.Dropout(0.3)(dec_emb)
-    dec_out, _, _    = tf.keras.layers.LSTM(HIDDEN, return_sequences=True,
-                        return_state=True, name="decoder_lstm")(
-                        dec_drop, initial_state=[enc_h, enc_c])
-    logits           = tf.keras.layers.Dense(DE_VOCAB,
-                        name="output_projection")(dec_out)
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size, emb_matrix, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.embedding.weight = nn.Parameter(
+            torch.tensor(emb_matrix), requires_grad=False)  # frozen phase 1
+        self.lstm    = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
 
-    model = tf.keras.Model(inputs=[enc_input, dec_input],
-                        outputs=logits, name="seq2seq_lstm")
-
-    # ─────────────────────────────────────────────
-    # 7. Masked loss, perplexity, compile
-    # ─────────────────────────────────────────────
-    _loss_base = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, reduction="none")
-
-    def masked_loss(y_true, y_pred):
-        loss = _loss_base(y_true, y_pred)
-        mask = tf.cast(tf.not_equal(y_true, de_w2i[PAD]), loss.dtype)
-        return tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
-
-    class Perplexity(tf.keras.metrics.Mean):
-        def update_state(self, y_true, y_pred, sample_weight=None):
-            super().update_state(tf.exp(masked_loss(y_true, y_pred)),
-                                sample_weight=sample_weight)
-
-    def compile_model(trainable_emb=False):
-        model.get_layer("enc_embedding").trainable = trainable_emb
-        model.get_layer("dec_embedding").trainable = trainable_emb
-        model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
-                    loss=masked_loss,
-                    metrics=[Perplexity(name="perplexity")])
-
-    compile_model(trainable_emb=False)
-    model.summary()
-
-    # ─────────────────────────────────────────────
-    # 8. Inference encoder / decoder
-    # ─────────────────────────────────────────────
-    enc_model = tf.keras.Model(inputs=enc_input,
-                            outputs=[enc_h, enc_c],
-                            name="inference_encoder")
-
-    dec_h_in   = tf.keras.Input(shape=(HIDDEN,), name="dec_h_in")
-    dec_c_in   = tf.keras.Input(shape=(HIDDEN,), name="dec_c_in")
-    dec_tok_in = tf.keras.Input(shape=(1,),      name="dec_token")
-
-    _emb   = model.get_layer("dec_embedding")(dec_tok_in)
-    _out, _h_out, _c_out = model.get_layer("decoder_lstm")(
-        _emb, initial_state=[dec_h_in, dec_c_in])
-    _logits = model.get_layer("output_projection")(_out)
-
-    dec_model = tf.keras.Model(
-        inputs  = [dec_tok_in, dec_h_in, dec_c_in],
-        outputs = [_logits, _h_out, _c_out],
-        name    = "inference_decoder")
+    def forward(self, x):
+        # x: (B, MAX_EN)
+        emb = self.dropout(self.embedding(x))          # (B, T, E)
+        _, (h, c) = self.lstm(emb)                     # h,c: (1, B, H)
+        return h, c
 
 
-    def translate(src_tokens, max_len=MAX_DE):
-        """Greedy decode a list of English word tokens → German word list."""
-        ei  = np.array([pad_seq(encode_en(src_tokens), MAX_EN, en_w2i[PAD])])
-        h, c = enc_model.predict(ei, verbose=0)
-        tok  = np.array([[de_w2i[SOS]]])
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size, emb_matrix, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.embedding.weight = nn.Parameter(
+            torch.tensor(emb_matrix), requires_grad=False)  # frozen phase 1
+        self.lstm    = nn.LSTM(embed_dim, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.fc      = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, x, h, c):
+        # x: (B, MAX_DE)
+        emb = self.dropout(self.embedding(x))          # (B, T, E)
+        out, (h, c) = self.lstm(emb, (h, c))           # (B, T, H)
+        logits = self.fc(out)                          # (B, T, V)
+        return logits, h, c
+
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, trg):
+        h, c = self.encoder(src)
+        logits, _, _ = self.decoder(trg, h, c)
+        return logits
+
+    def set_embeddings_trainable(self, trainable: bool):
+        for param in self.encoder.embedding.parameters():
+            param.requires_grad = trainable
+        for param in self.decoder.embedding.parameters():
+            param.requires_grad = trainable
+
+
+encoder = Encoder(EN_VOCAB, EMBED_DIM, HIDDEN, en_emb)
+decoder = Decoder(DE_VOCAB, EMBED_DIM, HIDDEN, de_emb)
+model   = Seq2Seq(encoder, decoder).to(DEVICE)
+
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"\nTrainable parameters: {total_params:,}")
+print(model)
+
+# ─────────────────────────────────────────────
+# 7. Loss (masked), perplexity, optimizer
+# ─────────────────────────────────────────────
+PAD_IDX = de_w2i[PAD]
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+
+def masked_loss_and_ppl(logits, targets):
+    # logits: (B, T, V)  targets: (B, T)
+    loss = criterion(logits.reshape(-1, DE_VOCAB), targets.reshape(-1))
+    return loss, float(torch.exp(loss))
+
+def make_optimizer(trainable_emb=False):
+    model.set_embeddings_trainable(trainable_emb)
+    return optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+
+# ─────────────────────────────────────────────
+# 8. Train / eval epoch helpers
+# ─────────────────────────────────────────────
+def run_epoch(loader, optimizer=None):
+    training = optimizer is not None
+    model.train() if training else model.eval()
+    total_loss, n = 0.0, 0
+    ctx = torch.enable_grad() if training else torch.no_grad()
+    with ctx:
+        for enc_in, dec_in, dec_tgt in loader:
+            enc_in  = enc_in.to(DEVICE)
+            dec_in  = dec_in.to(DEVICE)
+            dec_tgt = dec_tgt.to(DEVICE)
+            logits  = model(enc_in, dec_in)             # (B, T, V)
+            loss, _ = masked_loss_and_ppl(logits, dec_tgt)
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            total_loss += loss.item()
+            n          += 1
+    avg_loss = total_loss / n
+    return avg_loss, float(np.exp(avg_loss))
+
+# ─────────────────────────────────────────────
+# 9. Greedy translate (inference)
+# ─────────────────────────────────────────────
+def translate(src_tokens, max_len=MAX_DE):
+    model.eval()
+    ei  = torch.tensor(
+        [pad_seq(encode_en(src_tokens), MAX_EN, en_w2i[PAD])],
+        dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        h, c = model.encoder(ei)
+        tok  = torch.tensor([[de_w2i[SOS]]], dtype=torch.long, device=DEVICE)
         result = []
         for _ in range(max_len):
-            logits, h, c = dec_model.predict([tok, h, c], verbose=0)
-            next_id = int(np.argmax(logits[0, 0]))
+            logits, h, c = model.decoder(tok, h, c)    # (1, 1, V)
+            next_id = logits[0, 0].argmax().item()
             word    = de_i2w[next_id]
             if word == EOS:
                 break
             result.append(word)
-            tok = np.array([[next_id]])
-        return result
+            tok = torch.tensor([[next_id]], dtype=torch.long, device=DEVICE)
+    return result
 
-    # ─────────────────────────────────────────────
-    # 9. BLEU scoring
-    # ─────────────────────────────────────────────
-    smoother = SmoothingFunction().method1
+# ─────────────────────────────────────────────
+# 10. BLEU scoring
+# ─────────────────────────────────────────────
+smoother = SmoothingFunction().method1
 
-    def compute_bleu(en_sents, de_refs, label="BLEU", n_samples=500):
-        """Corpus BLEU over the first n_samples pairs."""
-        hypotheses, references = [], []
-        n = min(n_samples, len(en_sents))
-        for en, ref in zip(en_sents[:n], de_refs[:n]):
-            hypotheses.append(translate(en))
-            references.append([ref])
-        score = corpus_bleu(references, hypotheses,
-                            smoothing_function=smoother) * 100
-        print(f"[{label}]  Corpus BLEU-4: {score:.2f}")
-        return score
+def compute_bleu(en_sents, de_refs, label="BLEU", n_samples=500):
+    hypotheses, references = [], []
+    n = min(n_samples, len(en_sents))
+    for en, ref in zip(en_sents[:n], de_refs[:n]):
+        hypotheses.append(translate(en))
+        references.append([ref])
+    score = corpus_bleu(references, hypotheses,
+                        smoothing_function=smoother) * 100
+    print(f"[{label}]  Corpus BLEU-4: {score:.2f}")
+    return score
 
-    # ─────────────────────────────────────────────
-    # 10. Train (two-phase)
-    # ─────────────────────────────────────────────
-    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        filepath          = "lstm_multi30k_w2v.weights.h5",
-        save_weights_only = True,
-        save_best_only    = True,
-        monitor           = "val_loss",
-        verbose           = 1,
-    )
+# ─────────────────────────────────────────────
+# 11. Train (two-phase)
+# ─────────────────────────────────────────────
+best_val_loss = float("inf")
 
-    print("\n── Phase 1: frozen embeddings (5 epochs) ──")
-    model.fit(train_ds, validation_data=val_ds,
-            epochs=5, callbacks=[checkpoint_cb])
+def train_phase(epochs, trainable_emb, label):
+    global best_val_loss
+    optimizer = make_optimizer(trainable_emb)
+    print(f"\n── {label} ──")
+    for epoch in range(1, epochs + 1):
+        tr_loss, tr_ppl = run_epoch(train_dl, optimizer)
+        vl_loss, vl_ppl = run_epoch(val_dl)
+        print(f"  Epoch {epoch:>2}/{epochs} | "
+              f"train loss {tr_loss:.4f} ppl {tr_ppl:.1f} | "
+              f"val loss {vl_loss:.4f} ppl {vl_ppl:.1f}")
+        if vl_loss < best_val_loss:
+            best_val_loss = vl_loss
+            torch.save(model.state_dict(), "lstm_multi30k_w2v.pt")
+            print(f"           ✓ checkpoint saved (val_loss={best_val_loss:.4f})")
 
-    print("\n── Phase 2: fine-tuning embeddings + LSTM (25 epochs) ──")
-    compile_model(trainable_emb=True)
-    model.fit(train_ds, validation_data=val_ds,
-            epochs=10, callbacks=[checkpoint_cb])
+train_phase(5,  trainable_emb=False, label="Phase 1: frozen embeddings (5 epochs)")
+train_phase(10, trainable_emb=True,  label="Phase 2: fine-tuning embeddings + LSTM (10 epochs)")
 
-    # ─────────────────────────────────────────────
-    # 11. Final evaluation
-    # ─────────────────────────────────────────────
-    print("\n── Loss & Perplexity ──")
-    print("Train:", end=" "); model.evaluate(train_ds, verbose=1)
-    print("Val  :", end=" "); model.evaluate(val_ds,   verbose=1)
+# ─────────────────────────────────────────────
+# 12. Final evaluation
+# ─────────────────────────────────────────────
+model.load_state_dict(torch.load("lstm_multi30k_w2v.pt", map_location=DEVICE))
 
-    print("\n── BLEU scores (greedy, 500 samples) ──")
-    compute_bleu(train_en, train_de, label="train", n_samples=500)
-    compute_bleu(val_en,   val_de,   label="val  ", n_samples=500)
-    compute_bleu(test_en,  test_de,  label="test ", n_samples=500)
+print("\n── Final Loss & Perplexity ──")
+tr_loss, tr_ppl = run_epoch(train_dl)
+vl_loss, vl_ppl = run_epoch(val_dl)
+print(f"[train]  loss: {tr_loss:.4f}  |  perplexity: {tr_ppl:.2f}")
+print(f"[val  ]  loss: {vl_loss:.4f}  |  perplexity: {vl_ppl:.2f}")
 
-    # ─────────────────────────────────────────────
-    # 12. Demo translations
-    # ─────────────────────────────────────────────
-    print("\n── Example translations (EN → DE) ──")
-    demos = [
-        "a dog is running through the grass .",
-        "two people are sitting on a bench .",
-        "a man is riding a bicycle .",
-    ]
-    for src in demos:
-        hyp = translate(src.split())
-        print(f"  EN : {src}")
-        print(f"  DE : {' '.join(hyp)}\n")
+print("\n── BLEU scores (greedy, 500 samples) ──")
+compute_bleu(train_en, train_de, label="train", n_samples=500)
+compute_bleu(val_en,   val_de,   label="val  ", n_samples=500)
+compute_bleu(test_en,  test_de,  label="test ", n_samples=500)
+
+# ─────────────────────────────────────────────
+# 13. Demo translations
+# ─────────────────────────────────────────────
+print("\n── Example translations (EN → DE) ──")
+demos = [
+    "a dog is running through the grass .",
+    "two people are sitting on a bench .",
+    "a man is riding a bicycle .",
+]
+for src in demos:
+    hyp = translate(src.split())
+    print(f"  EN : {src}")
+    print(f"  DE : {' '.join(hyp)}\n")
